@@ -1,58 +1,40 @@
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
 import requests
 import math
 
 app = FastAPI(
     title="Wind Exposure API (ASCE 7)",
-    description="Direction-by-direction wind exposure classification using NLCD",
+    description="Direction-by-direction wind exposure classification using ASCE 7 with NLCD REST fallback",
     version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ==============================
+# Constants
+# ==============================
+
+NLCD_REST_URL = (
+    "https://landfire.cr.usgs.gov/arcgis/rest/services/NLCD/"
+    "Land_Cover_L48/MapServer/0/query"
 )
 
-# =========================
-# ASCE REFERENCES
-# =========================
-ASCE_REFS = [
-    "ASCE 7-16 Section 26.7.2 (Surface Roughness)",
-    "ASCE 7-16 Section 26.7.3 (Exposure Categories)"
-]
-
-# =========================
-# NLCD → Exposure Mapping
-# =========================
-NLCD_EXPOSURE_MAP = {
-    # Open water, barren, grassland → C
-    11: "C",  # Open Water
-    12: "C",  # Perennial Ice/Snow
-    31: "C",  # Barren
-    71: "C",  # Grassland
-    72: "C",
-    73: "C",
-    74: "C",
-    90: "C",  # Woody Wetlands
-    95: "C",
-
-    # Developed / Forest → B
-    21: "B",  # Developed Open Space
-    22: "B",
-    23: "B",
-    24: "B",
-    41: "B",  # Forest
-    42: "B",
-    43: "B"
+HEADERS = {
+    "User-Agent": "wind-exposure-api/1.0"
 }
 
-# =========================
-# DIRECTION SECTORS (±45°)
-# =========================
+# ASCE 7 roughness mapping (simplified, conservative)
+NLCD_TO_EXPOSURE = {
+    # Developed
+    21: "B", 22: "B", 23: "B", 24: "B",
+    # Forest / Shrub
+    41: "B", 42: "B", 43: "B",
+    # Grass / Crops
+    71: "C", 81: "C", 82: "C",
+    # Wetlands / Open
+    90: "C", 95: "C",
+    # Water
+    11: "D"
+}
+
 DIRECTIONS = [
     ("N", 315, 360),
     ("N", 0, 45),
@@ -62,90 +44,81 @@ DIRECTIONS = [
     ("S", 180, 225),
     ("SW", 225, 270),
     ("W", 270, 315),
+    ("NW", 315, 360),
 ]
 
-# =========================
-# NLCD QUERY (WMS)
-# =========================
-def query_nlcd(lat: float, lon: float) -> int | None:
+# ==============================
+# Helper functions
+# ==============================
+
+def query_nlcd_rest(lat: float, lon: float):
     """
-    Queries NLCD WMS for a single pixel.
-    IMPORTANT: WMS 1.3.0 with EPSG:4326 requires lon,lat axis order.
+    Uses NLCD REST Identify (robust, cloud-safe)
     """
-    delta = 0.00005  # ~5 m
-
-    lon_min = lon - delta
-    lon_max = lon + delta
-    lat_min = lat - delta
-    lat_max = lat + delta
-
-    url = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover_L48/wms"
-
     params = {
-        "service": "WMS",
-        "version": "1.3.0",
-        "request": "GetFeatureInfo",
-        "layers": "NLCD_2021_Land_Cover_L48",
-        "query_layers": "NLCD_2021_Land_Cover_L48",
-        "crs": "EPSG:4326",
-        # 🚨 CORRECT AXIS ORDER (lon,lat)
-        "bbox": f"{lon_min},{lat_min},{lon_max},{lat_max}",
-        "width": 3,
-        "height": 3,
-        "i": 1,
-        "j": 1,
-        "info_format": "application/json"
+        "f": "json",
+        "geometry": f"{lon},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "Value",
+        "returnGeometry": "false"
     }
 
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(NLCD_REST_URL, params=params, headers=HEADERS, timeout=10)
         r.raise_for_status()
         data = r.json()
+
         features = data.get("features", [])
         if not features:
             return None
-        return int(features[0]["properties"]["NLCD_Land_Cover"])
+
+        return features[0]["attributes"].get("Value")
+
     except Exception:
         return None
 
-# =========================
-# EXPOSURE ENDPOINT
-# =========================
+
+def classify_exposure(nlcd_code):
+    if nlcd_code is None:
+        return "C", "NLCD unavailable → conservative Exposure C applied"
+
+    exposure = NLCD_TO_EXPOSURE.get(nlcd_code, "C")
+    return exposure, f"NLCD code {nlcd_code} → Exposure {exposure}"
+
+
+# ==============================
+# API Endpoint
+# ==============================
+
 @app.get("/exposure")
 def exposure(
-    lat: float = Query(..., description="Latitude"),
-    lon: float = Query(..., description="Longitude"),
-    height_ft: float = Query(..., description="Building height in feet")
+    lat: float = Query(...),
+    lon: float = Query(...),
+    height_ft: float = Query(...)
 ):
-    directions_out = []
-    exposures_found = []
-
-    nlcd_code = query_nlcd(lat, lon)
-
-    exposure_class = NLCD_EXPOSURE_MAP.get(nlcd_code, "C") if nlcd_code else "C"
+    directions_output = []
+    governing = "B"
 
     for d in DIRECTIONS:
-        directions_out.append({
-            "direction": d[0],
-            "sector_degrees": f"{d[1]}–{d[2]}",
+        name, start, end = d
+        nlcd_code = query_nlcd_rest(lat, lon)
+        exposure_class, note = classify_exposure(nlcd_code)
+
+        if exposure_class == "D":
+            governing = "D"
+        elif exposure_class == "C" and governing != "D":
+            governing = "C"
+
+        directions_output.append({
+            "direction": name,
+            "sector_degrees": f"{start}–{end}",
             "nlcd_code": nlcd_code,
             "surface_roughness": exposure_class,
             "exposure": exposure_class,
-            "engineering_note": (
-                "Derived from NLCD land cover"
-                if nlcd_code else
-                "NLCD unavailable → conservative Exposure C applied"
-            )
+            "engineering_note": note
         })
-        exposures_found.append(exposure_class)
-
-    governing = "C"
-    if "D" in exposures_found:
-        governing = "D"
-    elif "C" in exposures_found:
-        governing = "C"
-    else:
-        governing = "B"
 
     return {
         "location": {
@@ -153,8 +126,11 @@ def exposure(
             "longitude": lon,
             "building_height_ft": height_ft
         },
-        "asce_reference": ASCE_REFS,
+        "asce_reference": [
+            "ASCE 7-16 Section 26.7.2 (Surface Roughness)",
+            "ASCE 7-16 Section 26.7.3 (Exposure Categories)"
+        ],
         "governing_exposure": governing,
-        "directions": directions_out,
+        "directions": directions_output,
         "status": "success"
     }
