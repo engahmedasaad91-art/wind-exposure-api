@@ -1,60 +1,86 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import math
 import requests
+import math
 
 app = FastAPI(
     title="Wind Exposure API (ASCE 7)",
-    description="Automatic wind exposure classification using NLCD land cover",
+    description="Direction-by-direction wind exposure classification using NLCD",
     version="1.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===============================
+# =========================
 # ASCE REFERENCES
-# ===============================
+# =========================
 ASCE_REFS = [
     "ASCE 7-16 Section 26.7.2 (Surface Roughness)",
     "ASCE 7-16 Section 26.7.3 (Exposure Categories)"
 ]
 
-# ===============================
-# NLCD → Roughness Mapping
-# ===============================
-NLCD_TO_ROUGHNESS = {
+# =========================
+# NLCD → Exposure Mapping
+# =========================
+NLCD_EXPOSURE_MAP = {
+    # Open water, barren, grassland → C
     11: "C",  # Open Water
     12: "C",  # Perennial Ice/Snow
-    21: "B",  # Developed, Open Space
-    22: "B",  # Developed, Low Intensity
-    23: "B",  # Developed, Medium Intensity
-    24: "B",  # Developed, High Intensity
-    31: "C",  # Barren Land
-    41: "B",  # Deciduous Forest
-    42: "B",  # Evergreen Forest
-    43: "B",  # Mixed Forest
-    52: "C",  # Shrub/Scrub
+    31: "C",  # Barren
     71: "C",  # Grassland
-    81: "C",  # Pasture/Hay
-    82: "C",  # Cultivated Crops
-    90: "B",  # Woody Wetlands
-    95: "C",  # Emergent Herbaceous Wetlands
+    72: "C",
+    73: "C",
+    74: "C",
+    90: "C",  # Woody Wetlands
+    95: "C",
+
+    # Developed / Forest → B
+    21: "B",  # Developed Open Space
+    22: "B",
+    23: "B",
+    24: "B",
+    41: "B",  # Forest
+    42: "B",
+    43: "B"
 }
 
-# ===============================
-# NLCD WMS SERVICE
-# ===============================
-NLCD_WMS_URL = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover_L48/wms"
+# =========================
+# DIRECTION SECTORS (±45°)
+# =========================
+DIRECTIONS = [
+    ("N", 315, 360),
+    ("N", 0, 45),
+    ("NE", 45, 90),
+    ("E", 90, 135),
+    ("SE", 135, 180),
+    ("S", 180, 225),
+    ("SW", 225, 270),
+    ("W", 270, 315),
+]
 
+# =========================
+# NLCD QUERY (WMS)
+# =========================
 def query_nlcd(lat: float, lon: float) -> int | None:
     """
-    Query NLCD land cover at a single point via WMS GetFeatureInfo.
+    Queries NLCD WMS for a single pixel.
+    IMPORTANT: WMS 1.3.0 with EPSG:4326 requires lon,lat axis order.
     """
+    delta = 0.00005  # ~5 m
+
+    lon_min = lon - delta
+    lon_max = lon + delta
+    lat_min = lat - delta
+    lat_max = lat + delta
+
+    url = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover_L48/wms"
+
     params = {
         "service": "WMS",
         "version": "1.3.0",
@@ -62,75 +88,63 @@ def query_nlcd(lat: float, lon: float) -> int | None:
         "layers": "NLCD_2021_Land_Cover_L48",
         "query_layers": "NLCD_2021_Land_Cover_L48",
         "crs": "EPSG:4326",
-        "bbox": f"{lat-0.0001},{lon-0.0001},{lat+0.0001},{lon+0.0001}",
-        "width": 101,
-        "height": 101,
-        "i": 50,
-        "j": 50,
+        # 🚨 CORRECT AXIS ORDER (lon,lat)
+        "bbox": f"{lon_min},{lat_min},{lon_max},{lat_max}",
+        "width": 3,
+        "height": 3,
+        "i": 1,
+        "j": 1,
         "info_format": "application/json"
     }
 
     try:
-        r = requests.get(NLCD_WMS_URL, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
         features = data.get("features", [])
         if not features:
             return None
-        return features[0]["properties"].get("NLCD_Land")
+        return int(features[0]["properties"]["NLCD_Land_Cover"])
     except Exception:
         return None
 
-# ===============================
-# EXPOSURE LOGIC
-# ===============================
-def exposure_from_roughness(z0: str) -> str:
-    if z0 == "B":
-        return "B"
-    return "C"
-
-# ===============================
-# API ENDPOINT
-# ===============================
+# =========================
+# EXPOSURE ENDPOINT
+# =========================
 @app.get("/exposure")
-def get_exposure(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    height_ft: float = Query(...)
+def exposure(
+    lat: float = Query(..., description="Latitude"),
+    lon: float = Query(..., description="Longitude"),
+    height_ft: float = Query(..., description="Building height in feet")
 ):
-    directions = [
-        ("N", "315–45°"),
-        ("NE", "0–90°"),
-        ("E", "45–135°"),
-        ("SE", "90–180°"),
-        ("S", "135–225°"),
-        ("SW", "180–270°"),
-        ("W", "225–315°"),
-        ("NW", "270–360°"),
-    ]
+    directions_out = []
+    exposures_found = []
 
-    direction_results = []
+    nlcd_code = query_nlcd(lat, lon)
 
-    for d, sector in directions:
-        nlcd = query_nlcd(lat, lon)
-        roughness = NLCD_TO_ROUGHNESS.get(nlcd, "C")
-        exposure = exposure_from_roughness(roughness)
+    exposure_class = NLCD_EXPOSURE_MAP.get(nlcd_code, "C") if nlcd_code else "C"
 
-        direction_results.append({
-            "direction": d,
-            "sector_degrees": sector,
-            "nlcd_code": nlcd,
-            "surface_roughness": roughness,
-            "exposure": exposure,
+    for d in DIRECTIONS:
+        directions_out.append({
+            "direction": d[0],
+            "sector_degrees": f"{d[1]}–{d[2]}",
+            "nlcd_code": nlcd_code,
+            "surface_roughness": exposure_class,
+            "exposure": exposure_class,
             "engineering_note": (
-                "Derived from NLCD land cover per ASCE 7-16 §26.7"
-                if nlcd is not None else
+                "Derived from NLCD land cover"
+                if nlcd_code else
                 "NLCD unavailable → conservative Exposure C applied"
             )
         })
+        exposures_found.append(exposure_class)
 
     governing = "C"
-    if all(d["exposure"] == "B" for d in direction_results):
+    if "D" in exposures_found:
+        governing = "D"
+    elif "C" in exposures_found:
+        governing = "C"
+    else:
         governing = "B"
 
     return {
@@ -141,6 +155,6 @@ def get_exposure(
         },
         "asce_reference": ASCE_REFS,
         "governing_exposure": governing,
-        "directions": direction_results,
+        "directions": directions_out,
         "status": "success"
     }
