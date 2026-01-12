@@ -5,3 +5,7 @@ numpy
 pyproj
 shapely
 requests
+rasterio
+numpy
+shapely
+pyproj
