@@ -6,7 +6,7 @@ from pyproj import Transformer
 
 app = FastAPI(title="Wind Exposure API")
 
-NLCD_PATH = "data/nlcd.tif"
+NLCD_PATH = "https://s3-us-west-2.amazonaws.com/mrlc/nlcd_2021_land_cover_l48_20210604.tif"
 transformer = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 
 def roughness_from_nlcd(code):
