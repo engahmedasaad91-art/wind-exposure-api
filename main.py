@@ -1,55 +1,16 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import requests
-from typing import List, Dict
+from fastapi import FastAPI, Query
+import rasterio
+import numpy as np
+from pyproj import Transformer
+from math import cos, sin, radians
 
 # ============================================================
-# App setup
+# CONFIG
 # ============================================================
 
-app = FastAPI(
-    title="Wind Exposure API",
-    description="ASCE 7-16 Directional Wind Exposure Classification using NLCD",
-    version="1.0.0"
-)
+NLCD_PATH = r"C:\wind_exposure_local\nlcd\nlcd_2021_conus.tif"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ============================================================
-# Constants
-# ============================================================
-
-# OFFICIAL MRLC / Esri-hosted NLCD FeatureServer (cloud-safe)
-NLCD_REST_URL = (
-    "https://services.arcgis.com/P3ePLMYs2RVChkJx/ArcGIS/rest/services/"
-    "NLCD_2019_Land_Cover_L48/FeatureServer/0/query"
-)
-
-# NLCD → ASCE Exposure Mapping (engineering conservative)
-NLCD_TO_EXPOSURE = {
-    11: "D",  # Open Water
-    12: "D",  # Perennial Ice/Snow
-    21: "B",  # Developed, Open Space
-    22: "B",  # Developed, Low Intensity
-    23: "B",  # Developed, Medium Intensity
-    24: "B",  # Developed, High Intensity
-    31: "C",  # Barren Land
-    41: "C",  # Deciduous Forest
-    42: "C",  # Evergreen Forest
-    43: "C",  # Mixed Forest
-    52: "C",  # Shrub/Scrub
-    71: "C",  # Grassland/Herbaceous
-    81: "C",  # Pasture/Hay
-    82: "C",  # Cultivated Crops
-    90: "C",  # Woody Wetlands
-    95: "C",  # Emergent Herbaceous Wetlands
-}
-
+# ASCE directional sectors (±45°)
 DIRECTIONS = [
     ("N", 315, 360),
     ("N", 0, 45),
@@ -61,91 +22,117 @@ DIRECTIONS = [
     ("W", 270, 315),
 ]
 
-# ============================================================
-# Helper Functions
-# ============================================================
-
-def query_nlcd(lat: float, lon: float):
-    """Query NLCD land cover code at a point"""
-    params = {
-        "f": "json",
-        "where": "1=1",
-        "geometry": f"{lon},{lat}",
-        "geometryType": "esriGeometryPoint",
-        "inSR": 4326,
-        "spatialRel": "esriSpatialRelIntersects",
-        "outFields": "Value",
-        "returnGeometry": "false"
-    }
-
-    try:
-        r = requests.get(NLCD_REST_URL, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
-        features = data.get("features", [])
-        if not features:
-            return None
-
-        return features[0]["attributes"].get("Value")
-
-    except Exception:
-        return None
-
-
-def exposure_from_nlcd(nlcd_code: int | None):
-    """Convert NLCD code to ASCE exposure"""
-    if nlcd_code is None:
-        return "C", "NLCD unavailable → conservative Exposure C applied"
-    return NLCD_TO_EXPOSURE.get(nlcd_code, "C"), "NLCD-based exposure applied"
-
+FETCH_DISTANCE_M = 800      # conservative ASCE fetch
+SAMPLE_STEP_M = 30          # NLCD resolution
 
 # ============================================================
-# API Endpoints
+# NLCD → ASCE EXPOSURE MAP
 # ============================================================
 
-@app.get("/")
-def root():
-    return {
-        "service": "Wind Exposure API",
-        "status": "running",
-        "standard": "ASCE 7-16"
-    }
+NLCD_TO_EXPOSURE = {
+    11: "D",   # Open water
+    12: "D",
+    21: "B",   # Developed
+    22: "B",
+    23: "B",
+    24: "B",
+    31: "C",   # Barren
+    41: "B",   # Forest
+    42: "B",
+    43: "B",
+    52: "C",
+    71: "C",
+    72: "C",
+    73: "C",
+    74: "C",
+    81: "C",   # Agriculture
+    82: "C",
+}
 
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(
+    title="Local ASCE 7 Wind Exposure Tool",
+    version="1.0"
+)
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def sample_nlcd(lat, lon, src, transformer):
+    x, y = transformer.transform(lon, lat)
+    row, col = src.index(x, y)
+    return int(src.read(1)[row, col])
+
+def direction_vector(angle_deg):
+    return cos(radians(angle_deg)), sin(radians(angle_deg))
+
+# ============================================================
+# API
+# ============================================================
 
 @app.get("/exposure")
-def get_exposure(
-    lat: float = Query(..., description="Latitude (WGS84)"),
-    lon: float = Query(..., description="Longitude (WGS84)"),
-    height_ft: float = Query(..., gt=0, description="Building height in feet"),
+def exposure(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    height_ft: float = Query(...)
 ):
-    nlcd_code = query_nlcd(lat, lon)
-    exposure, note = exposure_from_nlcd(nlcd_code)
+    with rasterio.open(NLCD_PATH) as src:
+        transformer = Transformer.from_crs(
+            "EPSG:4326", src.crs, always_xy=True
+        )
 
-    directions_output: List[Dict] = []
+        results = []
+        governing = "B"
 
-    for d, start, end in DIRECTIONS:
-        sector = f"{start}-{end}°"
-        directions_output.append({
-            "direction": d,
-            "sector_degrees": sector,
-            "nlcd_code": nlcd_code,
-            "surface_roughness": exposure,
-            "exposure": exposure,
-            "engineering_note": note
-        })
+        for name, start_deg, end_deg in DIRECTIONS:
+            exposures = []
+
+            angles = (
+                [start_deg] if start_deg == end_deg else
+                list(range(start_deg, end_deg, 5))
+            )
+
+            for angle in angles:
+                dx, dy = direction_vector(angle)
+
+                for d in range(0, FETCH_DISTANCE_M, SAMPLE_STEP_M):
+                    lat_s = lat + (dy * d / 111000)
+                    lon_s = lon + (dx * d / (111000 * cos(radians(lat))))
+
+                    try:
+                        nlcd = sample_nlcd(lat_s, lon_s, src, transformer)
+                        exp = NLCD_TO_EXPOSURE.get(nlcd, "C")
+                        exposures.append(exp)
+                    except Exception:
+                        continue
+
+            # majority rule
+            final_exp = max(set(exposures), key=exposures.count) if exposures else "C"
+            governing = max(governing, final_exp)
+
+            results.append({
+                "direction": name,
+                "exposure": final_exp
+            })
 
     return {
-        "location": {
-            "latitude": lat,
-            "longitude": lon,
-            "building_height_ft": height_ft
-        },
+        "location": {"lat": lat, "lon": lon, "height_ft": height_ft},
+        "governing_exposure": governing,
+        "directions": results,
         "asce_reference": [
-            "ASCE 7-16 Section 26.7.2 (Surface Roughness)",
-            "ASCE 7-16 Section 26.7.3 (Exposure Categories)"
-        ],
-        "governing_exposure": exposure,
-        "directions": directions_output,
-        "status": "success"
+            "ASCE 7-16 Section 26.7.2",
+            "ASCE 7-16 Section 26.7.3"
+        ]
     }
+
+# ============================================================
+# LOCAL RUN
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
